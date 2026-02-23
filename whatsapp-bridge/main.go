@@ -23,7 +23,9 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -90,6 +92,11 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Add unread tracking columns (ignore errors if they already exist)
+	db.Exec("ALTER TABLE chats ADD COLUMN unread_count INTEGER DEFAULT 0")
+	db.Exec("ALTER TABLE chats ADD COLUMN marked_as_unread BOOLEAN DEFAULT 0")
+	db.Exec("ALTER TABLE chats ADD COLUMN last_read_at TIMESTAMP")
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -98,11 +105,64 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database (preserves unread columns on conflict)
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET name=excluded.name, last_message_time=excluded.last_message_time`,
 		jid, name, lastMessageTime,
+	)
+	return err
+}
+
+// SetUnreadCount sets the unread count and marked_as_unread flag for a chat (used by history sync)
+func (store *MessageStore) SetUnreadCount(jid string, count uint32, markedAsUnread bool) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET unread_count = ?, marked_as_unread = ? WHERE jid = ?",
+		count, markedAsUnread, jid,
+	)
+	return err
+}
+
+// IncrementUnreadCount increments the unread count for a chat
+func (store *MessageStore) IncrementUnreadCount(jid string) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET unread_count = unread_count + 1 WHERE jid = ?",
+		jid,
+	)
+	return err
+}
+
+// ClearUnreadCount sets unread count to 0, marked_as_unread to false, and records the read timestamp
+func (store *MessageStore) ClearUnreadCount(jid string) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET unread_count = 0, marked_as_unread = 0, last_read_at = ? WHERE jid = ?",
+		time.Now(), jid,
+	)
+	return err
+}
+
+// RecalculateUnreadCounts recalculates unread counts on startup using last_read_at.
+func (store *MessageStore) RecalculateUnreadCounts() error {
+	_, err := store.db.Exec(`
+		UPDATE chats SET unread_count = (
+			SELECT COUNT(*) FROM messages
+			WHERE messages.chat_jid = chats.jid
+			AND messages.is_from_me = 0
+			AND messages.timestamp > chats.last_read_at
+		) WHERE chats.last_read_at IS NOT NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to recalculate unread counts: %v", err)
+	}
+	return nil
+}
+
+// SetMarkedAsUnread sets the marked_as_unread flag for a chat
+func (store *MessageStore) SetMarkedAsUnread(jid string, markedAsUnread bool) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET marked_as_unread = ? WHERE jid = ?",
+		markedAsUnread, jid,
 	)
 	return err
 }
@@ -423,6 +483,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	// Increment unread count for incoming messages
+	if !msg.Info.IsFromMe {
+		if err := messageStore.IncrementUnreadCount(chatJID); err != nil {
+			logger.Warnf("Failed to increment unread count: %v", err)
+		}
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -641,7 +708,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +841,154 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for marking a chat as read
+	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Parse JID
+		jid, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Invalid JID: %v", err)})
+			return
+		}
+
+		// Get most recent incoming message for this chat to send read receipt
+		var msgID, sender string
+		var msgTimestamp time.Time
+		err = messageStore.db.QueryRow(
+			"SELECT id, sender, timestamp FROM messages WHERE chat_jid = ? AND is_from_me = 0 ORDER BY timestamp DESC LIMIT 1",
+			req.ChatJID,
+		).Scan(&msgID, &sender, &msgTimestamp)
+
+		if err == nil && msgID != "" {
+			// Send read receipt
+			senderJID, parseErr := types.ParseJID(sender + "@s.whatsapp.net")
+			if parseErr == nil {
+				_ = client.MarkRead(context.Background(), []types.MessageID{msgID}, msgTimestamp, jid, senderJID)
+			}
+		}
+
+		// Use the most recent message timestamp (from any message) for app state
+		var lastMsgTimestamp time.Time
+		var lastMsgID *string
+		var lastMsgFromMe *bool
+		err = messageStore.db.QueryRow(
+			"SELECT id, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
+			req.ChatJID,
+		).Scan(&lastMsgID, &lastMsgTimestamp, &lastMsgFromMe)
+
+		if err != nil {
+			lastMsgTimestamp = time.Now()
+		}
+
+		// Build message key for app state
+		var msgKey *waCommon.MessageKey
+		if lastMsgID != nil {
+			fromMe := lastMsgFromMe != nil && *lastMsgFromMe
+			msgKey = &waCommon.MessageKey{
+				RemoteJID: proto.String(req.ChatJID),
+				FromMe:    proto.Bool(fromMe),
+				ID:        proto.String(*lastMsgID),
+			}
+		}
+
+		// Sync app state to mark chat as read across devices
+		err = client.SendAppState(context.Background(), appstate.BuildMarkChatAsRead(jid, true, lastMsgTimestamp, msgKey))
+		if err != nil {
+			fmt.Printf("Warning: failed to send app state for mark-read: %v\n", err)
+		}
+
+		// Clear local unread count
+		messageStore.ClearUnreadCount(req.ChatJID)
+
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Chat marked as read"})
+	})
+
+	// Handler for marking a chat as unread
+	http.HandleFunc("/api/mark-unread", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Parse JID
+		jid, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Invalid JID: %v", err)})
+			return
+		}
+
+		// Get most recent message timestamp for app state
+		var lastMsgTimestamp time.Time
+		var lastMsgID *string
+		var lastMsgFromMe *bool
+		err = messageStore.db.QueryRow(
+			"SELECT id, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
+			req.ChatJID,
+		).Scan(&lastMsgID, &lastMsgTimestamp, &lastMsgFromMe)
+
+		if err != nil {
+			lastMsgTimestamp = time.Now()
+		}
+
+		// Build message key for app state
+		var msgKey *waCommon.MessageKey
+		if lastMsgID != nil {
+			fromMe := lastMsgFromMe != nil && *lastMsgFromMe
+			msgKey = &waCommon.MessageKey{
+				RemoteJID: proto.String(req.ChatJID),
+				FromMe:    proto.Bool(fromMe),
+				ID:        proto.String(*lastMsgID),
+			}
+		}
+
+		// Sync app state to mark chat as unread across devices
+		err = client.SendAppState(context.Background(), appstate.BuildMarkChatAsRead(jid, false, lastMsgTimestamp, msgKey))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Failed to sync app state: %v", err)})
+			return
+		}
+
+		// Set local marked-as-unread flag
+		messageStore.SetMarkedAsUnread(req.ChatJID, true)
+
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Chat marked as unread"})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +1015,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -845,8 +1060,39 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.Receipt:
+			// Clear unread when messages are read (locally or from another device)
+			if v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypeReadSelf {
+				chatJID := v.Chat.String()
+				if err := messageStore.ClearUnreadCount(chatJID); err != nil {
+					logger.Warnf("Failed to clear unread count on receipt: %v", err)
+				}
+			}
+
+		case *events.MarkChatAsRead:
+			// Real-time mark-as-read/unread from other devices
+			if !v.FromFullSync {
+				chatJID := v.JID.String()
+				if v.Action.GetRead() {
+					if err := messageStore.ClearUnreadCount(chatJID); err != nil {
+						logger.Warnf("Failed to clear unread count on mark-read: %v", err)
+					}
+				} else {
+					if err := messageStore.SetMarkedAsUnread(chatJID, true); err != nil {
+						logger.Warnf("Failed to set marked-as-unread: %v", err)
+					}
+				}
+			}
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			go func() {
+				// Brief delay to let history sync deliver messages first
+				time.Sleep(5 * time.Second)
+				if err := messageStore.RecalculateUnreadCounts(); err != nil {
+					logger.Warnf("Failed to recalculate unread counts: %v", err)
+				}
+			}()
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -973,7 +1219,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1234,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1046,6 +1292,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			}
 
 			messageStore.StoreChat(chatJID, name, timestamp)
+
+			// Set unread count from history sync (only if non-zero, to avoid
+			// overwriting state from app state sync on subsequent connections)
+			unreadCount := conversation.GetUnreadCount()
+			markedUnread := conversation.GetMarkedAsUnread()
+			if unreadCount > 0 || markedUnread {
+				messageStore.SetUnreadCount(chatJID, unreadCount, markedUnread)
+			}
 
 			// Store messages
 			for _, msg := range messages {

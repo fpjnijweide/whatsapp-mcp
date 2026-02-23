@@ -12,7 +12,9 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    mark_chat_read as whatsapp_mark_chat_read,
+    mark_chat_unread as whatsapp_mark_chat_unread
 )
 
 # Initialize FastMCP server
@@ -75,23 +77,26 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    unread_only: bool = False
 ) -> List[Dict[str, Any]]:
-    """Get WhatsApp chats matching specified criteria.
-    
+    """Get WhatsApp chats matching specified criteria. Results include unread_count and marked_as_unread fields.
+
     Args:
         query: Optional search term to filter chats by name or JID
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+        unread_only: When True, only return chats with unread messages or marked as unread (default False)
     """
     chats = whatsapp_list_chats(
         query=query,
         limit=limit,
         page=page,
         include_last_message=include_last_message,
-        sort_by=sort_by
+        sort_by=sort_by,
+        unread_only=unread_only
     )
     return chats
 
@@ -216,6 +221,32 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
         A dictionary containing success status and a status message
     """
     success, status_message = whatsapp_audio_voice_message(recipient, media_path)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def mark_chat_read(chat_jid: str) -> Dict[str, Any]:
+    """Mark a WhatsApp chat as read. This syncs across all devices — the chat will also show as read on your phone.
+
+    Args:
+        chat_jid: The JID of the chat to mark as read (e.g., "123456789@s.whatsapp.net" or a group JID)
+    """
+    success, status_message = whatsapp_mark_chat_read(chat_jid)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def mark_chat_unread(chat_jid: str) -> Dict[str, Any]:
+    """Mark a WhatsApp chat as unread. This syncs across all devices — a green unread dot will appear on your phone.
+
+    Args:
+        chat_jid: The JID of the chat to mark as unread (e.g., "123456789@s.whatsapp.net" or a group JID)
+    """
+    success, status_message = whatsapp_mark_chat_unread(chat_jid)
     return {
         "success": success,
         "message": status_message

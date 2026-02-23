@@ -29,6 +29,8 @@ class Chat:
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
+    unread_count: int = 0
+    marked_as_unread: bool = False
 
     @property
     def is_group(self) -> bool:
@@ -321,53 +323,59 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    unread_only: bool = False
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         # Build base query
         query_parts = ["""
-            SELECT 
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
                 messages.content as last_message,
                 messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                messages.is_from_me as last_is_from_me,
+                chats.unread_count,
+                chats.marked_as_unread
             FROM chats
         """]
-        
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
-            
+
         where_clauses = []
         params = []
-        
+
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-            
+
+        if unread_only:
+            where_clauses.append("(chats.unread_count > 0 OR chats.marked_as_unread = 1)")
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
-            
+
         # Add sorting
         order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
         query_parts.append(f"ORDER BY {order_by}")
-        
+
         # Add pagination
         offset = (page ) * limit
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
-        
+
         cursor.execute(" ".join(query_parts), tuple(params))
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
             chat = Chat(
@@ -376,12 +384,14 @@ def list_chats(
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                unread_count=chat_data[6] or 0,
+                marked_as_unread=bool(chat_data[7])
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -451,16 +461,18 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                c.unread_count,
+                c.marked_as_unread
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
             WHERE m.sender = ? OR c.jid = ?
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
-        
+
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
             chat = Chat(
@@ -469,7 +481,9 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                unread_count=chat_data[6] or 0,
+                marked_as_unread=bool(chat_data[7])
             )
             result.append(chat)
             
@@ -537,39 +551,43 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         query = """
-            SELECT 
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                c.unread_count,
+                c.marked_as_unread
             FROM chats c
         """
-        
+
         if include_last_message:
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
+                LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             """
-            
+
         query += " WHERE c.jid = ?"
-        
+
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
         return Chat(
             jid=chat_data[0],
             name=chat_data[1],
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
+            last_is_from_me=chat_data[5],
+            unread_count=chat_data[6] or 0,
+            marked_as_unread=bool(chat_data[7])
         )
         
     except sqlite3.Error as e:
@@ -587,32 +605,36 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT 
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                c.unread_count,
+                c.marked_as_unread
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
+            LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
             LIMIT 1
         """, (f"%{sender_phone_number}%",))
-        
+
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
         return Chat(
             jid=chat_data[0],
             name=chat_data[1],
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
+            last_is_from_me=chat_data[5],
+            unread_count=chat_data[6] or 0,
+            marked_as_unread=bool(chat_data[7])
         )
         
     except sqlite3.Error as e:
@@ -717,6 +739,54 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def mark_chat_read(chat_jid: str) -> Tuple[bool, str]:
+    """Mark a chat as read locally and on WhatsApp (syncs to phone)."""
+    try:
+        if not chat_jid:
+            return False, "chat_jid must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/mark-read"
+        payload = {"chat_jid": chat_jid}
+
+        response = requests.post(url, json=payload)
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def mark_chat_unread(chat_jid: str) -> Tuple[bool, str]:
+    """Mark a chat as unread locally and on WhatsApp (syncs to phone)."""
+    try:
+        if not chat_jid:
+            return False, "chat_jid must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/mark-unread"
+        payload = {"chat_jid": chat_jid}
+
+        response = requests.post(url, json=payload)
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
