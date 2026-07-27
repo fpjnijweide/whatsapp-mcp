@@ -1112,9 +1112,23 @@ func main() {
 			return
 		}
 
+		// ponytail: WA_PAIR_PHONE=<number, no +> pairs with an 8-char code instead of a QR, for headless/remote setup
+		pairPhone := os.Getenv("WA_PAIR_PHONE")
+		if pairPhone != "" {
+			code, err := client.PairPhone(context.Background(), pairPhone, true, whatsmeow.PairClientChrome, "Chrome (MacOS)")
+			if err != nil {
+				logger.Errorf("Failed to request pairing code: %v", err)
+				return
+			}
+			fmt.Printf("\nPAIRING CODE: %s\nEnter under WhatsApp > Linked Devices > Link a Device > Link with phone number instead\n", code)
+		}
+
 		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
+				if pairPhone != "" {
+					continue
+				}
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
