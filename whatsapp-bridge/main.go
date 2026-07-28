@@ -733,13 +733,11 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// ponytail: keep the query string. whatsmeow builds the CDN URL as
+	// "https://" + host + directPath + "&hash=...", so it relies on directPath
+	// still carrying its "?ccb=..." query. Stripping it yields a URL with no "?"
+	// at all and the media CDN answers 403.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
