@@ -275,6 +275,18 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
+	// Media captions are the message text for image/video/document sends.
+	// Without this, a captioned photo stores as bare media and the words vanish.
+	if img := msg.GetImageMessage(); img != nil && img.GetCaption() != "" {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil && vid.GetCaption() != "" {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil && doc.GetCaption() != "" {
+		return doc.GetCaption()
+	}
+
 	// For now, we're ignoring non-text messages
 	return ""
 }
@@ -1179,6 +1191,19 @@ func main() {
 				// marked read or unread while the bridge was down is missed, and
 				// nothing ever asks for it again. markChatAsRead lives in
 				// regular_low; fullSync=false fetches just the missed patches.
+				// WA_APPSTATE_RECOVER=1: ask the primary phone for a clean copy of
+				// regular_low (BuildAppStateRecoveryRequest). This is the documented
+				// cure for a desynced collection ("mismatching LTHash"), where even a
+				// fresh server snapshot fails to verify. One-shot, run manually.
+				if os.Getenv("WA_APPSTATE_RECOVER") == "1" {
+					_, err := client.SendPeerMessage(context.Background(), whatsmeow.BuildAppStateRecoveryRequest(appstate.WAPatchRegularLow))
+					if err != nil {
+						logger.Errorf("Failed to send app state recovery request: %v", err)
+					} else {
+						logger.Infof("App state recovery request sent for regular_low")
+					}
+				}
+
 				if err := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, false, false); err != nil {
 					logger.Warnf("Failed to sync app state on connect: %v", err)
 				}
