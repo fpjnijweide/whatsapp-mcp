@@ -2,11 +2,72 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// The unread count history sync reports is WhatsApp's own, and it has to survive
+// RecalculateUnreadCounts() running seconds later on connect. Before SetUnreadCount
+// anchored last_read_at, recalc rebuilt the number from a stale timestamp and
+// overwrote the authoritative one -- a chat WhatsApp reported as 2 drifted to 146.
+func TestHistorySyncUnreadSurvivesRecalculate(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`
+		CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP,
+			unread_count INTEGER DEFAULT 0, marked_as_unread BOOLEAN DEFAULT 0, last_read_at TIMESTAMP);
+		CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT,
+			timestamp TIMESTAMP, is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT,
+			media_key BLOB, file_sha256 BLOB, file_enc_sha256 BLOB, file_length INTEGER,
+			PRIMARY KEY (id, chat_jid));`); err != nil {
+		t.Fatal(err)
+	}
+	store := &MessageStore{db: db}
+
+	const jid = "group@g.us"
+	// A stale last_read_at with plenty of incoming traffic after it: left alone,
+	// recalc would call all 20 of these unread.
+	if _, err := db.Exec("INSERT INTO chats (jid, unread_count, last_read_at) VALUES (?, 146, ?)",
+		jid, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 20; i++ {
+		if _, err := db.Exec(`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+			VALUES (?, ?, 'them', 'hi', ?, 0)`, fmt.Sprintf("m%d", i), jid, base.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// History sync reports the truth: only 2 are actually unread.
+	if err := store.SetUnreadCount(jid, 2, false); err != nil {
+		t.Fatal(err)
+	}
+	var got int
+	if err := db.QueryRow("SELECT unread_count FROM chats WHERE jid = ?", jid).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Fatalf("SetUnreadCount stored %d, want 2", got)
+	}
+
+	// ...and it must still be 2 after the connect-time rebuild.
+	if err := store.RecalculateUnreadCounts(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT unread_count FROM chats WHERE jid = ?", jid).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Errorf("recalculate overwrote the authoritative count: got %d, want 2", got)
+	}
+}
 
 // ClearUnreadCount must never move last_read_at backwards. RecalculateUnreadCounts()
 // rebuilds unread from that column on every startup, so a regressed timestamp

@@ -115,11 +115,30 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
-// SetUnreadCount sets the unread count and marked_as_unread flag for a chat (used by history sync)
+// SetUnreadCount sets the unread count and marked_as_unread flag for a chat, and
+// anchors last_read_at to agree with the count (used by history sync).
+//
+// History sync carries WhatsApp's own unread count -- the only authoritative
+// number the bridge ever receives. Storing it alone was not enough: on every
+// connect, RecalculateUnreadCounts() runs a few seconds later and rebuilds
+// unread_count from last_read_at, overwriting the authoritative value with the
+// bridge's own stale reconstruction. That race is how a chat WhatsApp reported
+// as 2 unread drifted up to 146.
+//
+// Anchoring on the (count+1)-th newest incoming message makes recalc reproduce
+// this number rather than replace it: the comparison is strictly greater-than,
+// so that message is excluded and exactly count newer ones are counted.
 func (store *MessageStore) SetUnreadCount(jid string, count uint32, markedAsUnread bool) error {
 	_, err := store.db.Exec(
-		"UPDATE chats SET unread_count = ?, marked_as_unread = ? WHERE jid = ?",
-		count, markedAsUnread, jid,
+		`UPDATE chats
+		    SET unread_count = ?, marked_as_unread = ?,
+		        last_read_at = COALESCE(
+		            (SELECT timestamp FROM messages
+		              WHERE chat_jid = chats.jid AND is_from_me = 0
+		              ORDER BY timestamp DESC LIMIT 1 OFFSET ?),
+		            last_read_at)
+		  WHERE jid = ?`,
+		count, markedAsUnread, count, jid,
 	)
 	return err
 }
@@ -1154,6 +1173,16 @@ func main() {
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 			go func() {
+				// Catch up on read/unread changes made while we were offline.
+				// whatsmeow only fetches app state when the server pushes a sync
+				// notification, and those arrive over the socket -- so anything
+				// marked read or unread while the bridge was down is missed, and
+				// nothing ever asks for it again. markChatAsRead lives in
+				// regular_low; fullSync=false fetches just the missed patches.
+				if err := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, false, false); err != nil {
+					logger.Warnf("Failed to sync app state on connect: %v", err)
+				}
+
 				// Brief delay to let history sync deliver messages first
 				time.Sleep(5 * time.Second)
 				if err := messageStore.RecalculateUnreadCounts(); err != nil {
