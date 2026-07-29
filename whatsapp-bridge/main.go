@@ -133,11 +133,22 @@ func (store *MessageStore) IncrementUnreadCount(jid string) error {
 	return err
 }
 
-// ClearUnreadCount sets unread count to 0, marked_as_unread to false, and records the read timestamp
-func (store *MessageStore) ClearUnreadCount(jid string) error {
+// ClearUnreadCount sets unread count to 0, marked_as_unread to false, and records the read timestamp.
+//
+// readAt is when the chat was actually read, not when we heard about it. Receipts
+// can arrive late, and stamping time.Now() silently marks anything that landed in
+// the gap as read. It also never moves backwards: RecalculateUnreadCounts() rebuilds
+// unread from last_read_at on every startup, so an out-of-order receipt that
+// regressed it would resurrect already-read messages on the next restart.
+func (store *MessageStore) ClearUnreadCount(jid string, readAt time.Time) error {
 	_, err := store.db.Exec(
-		"UPDATE chats SET unread_count = 0, marked_as_unread = 0, last_read_at = ? WHERE jid = ?",
-		time.Now(), jid,
+		`UPDATE chats SET unread_count = 0, marked_as_unread = 0,
+		     last_read_at = CASE
+		         WHEN last_read_at IS NULL OR last_read_at = '' OR ? > last_read_at THEN ?
+		         ELSE last_read_at
+		     END
+		 WHERE jid = ?`,
+		readAt, readAt, jid,
 	)
 	return err
 }
@@ -150,7 +161,7 @@ func (store *MessageStore) RecalculateUnreadCounts() error {
 			WHERE messages.chat_jid = chats.jid
 			AND messages.is_from_me = 0
 			AND messages.timestamp > chats.last_read_at
-		) WHERE chats.last_read_at IS NOT NULL
+		) WHERE chats.last_read_at IS NOT NULL AND chats.last_read_at <> ''
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to recalculate unread counts: %v", err)
@@ -468,14 +479,60 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// canonicalJID collapses a @lid JID onto the phone-number JID it maps to.
+//
+// WhatsApp migrated this account to LID addressing, after which every 1:1 chat
+// starts arriving under a fresh xxx@lid JID. Without this, each contact forks
+// into two chat rows: the old @s.whatsapp.net row keeps the contact name and all
+// history but goes silent, while the new @lid row collects the live messages
+// under an unresolved numeric name. Keying the database off the phone JID keeps
+// one contact in one row. Falls back to the input if no mapping is known yet.
+func canonicalJID(client *whatsmeow.Client, jid types.JID) types.JID {
+	if client == nil || client.Store == nil || jid.Server != types.HiddenUserServer {
+		return jid
+	}
+	pn, err := client.Store.GetAltJID(context.Background(), jid)
+	if err != nil || pn.IsEmpty() {
+		return jid
+	}
+	return pn
+}
+
+// canonicalJIDString is canonicalJID for JIDs that arrive as strings.
+func canonicalJIDString(client *whatsmeow.Client, chatJID string) string {
+	jid, err := types.ParseJID(chatJID)
+	if err != nil {
+		return chatJID
+	}
+	return canonicalJID(client, jid).String()
+}
+
+// protocolJID maps a chat JID to the form WhatsApp itself keys the chat by.
+// App state indices (appstate.BuildMarkChatAsRead) are matched as raw JID
+// strings against what the phone writes, and post-migration the phone writes
+// LID for 1:1 chats — so outgoing read/unread syncs must use the LID form even
+// though we store the phone form. Falls back to the input if unmapped.
+func protocolJID(client *whatsmeow.Client, jid types.JID) types.JID {
+	if client == nil || client.Store == nil || jid.Server != types.DefaultUserServer {
+		return jid
+	}
+	lid, err := client.Store.GetAltJID(context.Background(), jid)
+	if err != nil || lid.IsEmpty() {
+		return jid
+	}
+	return lid
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Save message to database, keyed by the phone JID so LID and pre-migration
+	// messages from the same contact land in one chat
+	chatJIDParsed := canonicalJID(client, msg.Info.Chat)
+	chatJID := chatJIDParsed.String()
+	sender := canonicalJID(client, msg.Info.Sender).User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chatJIDParsed, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -868,19 +925,23 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		// Rows are keyed by phone JID, app state by whatever form WhatsApp uses
+		dbJID := canonicalJID(client, jid).String()
+		jid = protocolJID(client, canonicalJID(client, jid))
+
 		// Get most recent incoming message for this chat to send read receipt
 		var msgID, sender string
 		var msgTimestamp time.Time
 		err = messageStore.db.QueryRow(
 			"SELECT id, sender, timestamp FROM messages WHERE chat_jid = ? AND is_from_me = 0 ORDER BY timestamp DESC LIMIT 1",
-			req.ChatJID,
+			dbJID,
 		).Scan(&msgID, &sender, &msgTimestamp)
 
 		if err == nil && msgID != "" {
 			// Send read receipt
 			senderJID, parseErr := types.ParseJID(sender + "@s.whatsapp.net")
 			if parseErr == nil {
-				_ = client.MarkRead(context.Background(), []types.MessageID{msgID}, msgTimestamp, jid, senderJID)
+				_ = client.MarkRead(context.Background(), []types.MessageID{msgID}, msgTimestamp, jid, protocolJID(client, senderJID))
 			}
 		}
 
@@ -890,7 +951,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		var lastMsgFromMe *bool
 		err = messageStore.db.QueryRow(
 			"SELECT id, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
-			req.ChatJID,
+			dbJID,
 		).Scan(&lastMsgID, &lastMsgTimestamp, &lastMsgFromMe)
 
 		if err != nil {
@@ -902,7 +963,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if lastMsgID != nil {
 			fromMe := lastMsgFromMe != nil && *lastMsgFromMe
 			msgKey = &waCommon.MessageKey{
-				RemoteJID: proto.String(req.ChatJID),
+				RemoteJID: proto.String(jid.String()),
 				FromMe:    proto.Bool(fromMe),
 				ID:        proto.String(*lastMsgID),
 			}
@@ -914,8 +975,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			fmt.Printf("Warning: failed to send app state for mark-read: %v\n", err)
 		}
 
-		// Clear local unread count
-		messageStore.ClearUnreadCount(req.ChatJID)
+		// Clear local unread count. This one is a direct user action, so the read
+		// really is happening now -- unlike the receipt handlers below.
+		messageStore.ClearUnreadCount(dbJID, time.Now())
 
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Chat marked as read"})
 	})
@@ -949,13 +1011,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		// Rows are keyed by phone JID, app state by whatever form WhatsApp uses
+		dbJID := canonicalJID(client, jid).String()
+		jid = protocolJID(client, canonicalJID(client, jid))
+
 		// Get most recent message timestamp for app state
 		var lastMsgTimestamp time.Time
 		var lastMsgID *string
 		var lastMsgFromMe *bool
 		err = messageStore.db.QueryRow(
 			"SELECT id, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
-			req.ChatJID,
+			dbJID,
 		).Scan(&lastMsgID, &lastMsgTimestamp, &lastMsgFromMe)
 
 		if err != nil {
@@ -967,7 +1033,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if lastMsgID != nil {
 			fromMe := lastMsgFromMe != nil && *lastMsgFromMe
 			msgKey = &waCommon.MessageKey{
-				RemoteJID: proto.String(req.ChatJID),
+				RemoteJID: proto.String(jid.String()),
 				FromMe:    proto.Bool(fromMe),
 				ID:        proto.String(*lastMsgID),
 			}
@@ -982,7 +1048,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Set local marked-as-unread flag
-		messageStore.SetMarkedAsUnread(req.ChatJID, true)
+		messageStore.SetMarkedAsUnread(dbJID, true)
 
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Chat marked as unread"})
 	})
@@ -1061,8 +1127,8 @@ func main() {
 		case *events.Receipt:
 			// Clear unread when messages are read (locally or from another device)
 			if v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypeReadSelf {
-				chatJID := v.Chat.String()
-				if err := messageStore.ClearUnreadCount(chatJID); err != nil {
+				chatJID := canonicalJID(client, v.Chat).String()
+				if err := messageStore.ClearUnreadCount(chatJID, v.Timestamp); err != nil {
 					logger.Warnf("Failed to clear unread count on receipt: %v", err)
 				}
 			}
@@ -1070,9 +1136,9 @@ func main() {
 		case *events.MarkChatAsRead:
 			// Real-time mark-as-read/unread from other devices
 			if !v.FromFullSync {
-				chatJID := v.JID.String()
+				chatJID := canonicalJID(client, v.JID).String()
 				if v.Action.GetRead() {
-					if err := messageStore.ClearUnreadCount(chatJID); err != nil {
+					if err := messageStore.ClearUnreadCount(chatJID, v.Timestamp); err != nil {
 						logger.Warnf("Failed to clear unread count on mark-read: %v", err)
 					}
 				} else {
@@ -1274,14 +1340,16 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		chatJID := *conversation.ID
-
 		// Try to parse the JID
-		jid, err := types.ParseJID(chatJID)
+		jid, err := types.ParseJID(*conversation.ID)
 		if err != nil {
-			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
+			logger.Warnf("Failed to parse JID %s: %v", *conversation.ID, err)
 			continue
 		}
+
+		// Key history off the phone JID for the same reason as live messages
+		jid = canonicalJID(client, jid)
+		chatJID := jid.String()
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
@@ -1354,7 +1422,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
+						// Group participants also migrated to LID; store the phone
+						// user so senders stay comparable across the migration
 						sender = *msg.Message.Key.Participant
+						if pjid, perr := types.ParseJID(sender); perr == nil {
+							sender = canonicalJID(client, pjid).User
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
