@@ -540,13 +540,6 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
-	// Increment unread count for incoming messages
-	if !msg.Info.IsFromMe {
-		if err := messageStore.IncrementUnreadCount(chatJID); err != nil {
-			logger.Warnf("Failed to increment unread count: %v", err)
-		}
-	}
-
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -556,6 +549,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
+	}
+
+	// Increment unread count for incoming messages. This has to sit below the skip
+	// above: reactions, polls and protocol messages never reach the messages table,
+	// so counting them here left unread_count permanently ahead of what
+	// RecalculateUnreadCounts() can find, and every restart silently revised it down.
+	if !msg.Info.IsFromMe {
+		if err := messageStore.IncrementUnreadCount(chatJID); err != nil {
+			logger.Warnf("Failed to increment unread count: %v", err)
+		}
 	}
 
 	// Store message in database
