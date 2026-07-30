@@ -305,7 +305,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -464,10 +464,31 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// WhatsApp never echoes a device's own sends back to it, so store the message
+	// now -- waiting on handleMessage meant bridge-sent messages only surfaced in
+	// the DB after a later history sync happened to backfill them.
+	chatJID := canonicalJID(client, recipientJID).String()
+	sender := ""
+	if client.Store.ID != nil {
+		sender = canonicalJID(client, *client.Store.ID).User
+	}
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	content := extractTextContent(msg)
+	if err := messageStore.StoreMessage(resp.ID, chatJID, sender, content, resp.Timestamp, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
+		fmt.Printf("Failed to store own sent message: %v\n", err)
+	}
+	// Bump last_message_time without clobbering an existing chat name.
+	if _, err := messageStore.db.Exec(`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET last_message_time=excluded.last_message_time`,
+		chatJID, recipientJID.User, resp.Timestamp); err != nil {
+		fmt.Printf("Failed to bump chat on send: %v\n", err)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -862,7 +883,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
